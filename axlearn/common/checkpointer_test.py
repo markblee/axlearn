@@ -5,12 +5,15 @@
 Some tests are intended to be run on TPU.
 """
 
-# pylint: disable=no-self-use,protected-access
 import os
+import queue
 import re
 import tempfile
 import threading
-from typing import Iterable, List, Optional, Sequence
+
+# pylint: disable=no-self-use,protected-access
+from math import ceil
+from typing import Dict, Iterable, List, Optional, Sequence
 from unittest import mock
 
 import jax
@@ -651,6 +654,10 @@ class CheckpointerTest(test_utils.TestCase):
 
 
 class TensorStoreStateStorageTest(test_utils.TestCase):
+    def test_chunk_size_gb(self):
+        with self.assertRaisesRegex(ValueError, "strictly positive"):
+            TensorStoreStateStorage.default_config().set(chunk_size_gb=0).instantiate()
+
     @parameterized.parameters(jnp.float32, jnp.bfloat16, jnp.int32, jnp.int16)
     def test_save_and_restore_from_dir(self, restore_floats_as: jnp.dtype):
         mesh_shape = (1, 1)
@@ -670,17 +677,13 @@ class TensorStoreStateStorageTest(test_utils.TestCase):
                 storage.save_to_dir(step=step, state=state, ckpt_dir=final_dir)
                 storage.wait_until_finished()
 
-                # Restore.
-                def restore_state():
-                    return storage.restore_from_dir(
-                        step,
-                        state=make_state(float_dtype=restore_floats_as),
-                        ckpt_dir=final_dir,
-                        validation=CheckpointValidationType.EXACT_UP_TO_DTYPE,
-                    )
-
                 # Successfully restores with different dtypes.
-                restored_state = restore_state()
+                restored_state = storage.restore_from_dir(
+                    step,
+                    state=make_state(float_dtype=restore_floats_as),
+                    ckpt_dir=final_dir,
+                    validation=CheckpointValidationType.EXACT_UP_TO_DTYPE,
+                )
                 self.assertNestedEqual(
                     restored_state,
                     (
@@ -689,6 +692,147 @@ class TensorStoreStateStorageTest(test_utils.TestCase):
                         else make_state(float_dtype=restore_floats_as)
                     ),
                 )
+
+    def test_save_to_dir_async(self):
+        """Tests that serialization happens async."""
+        mesh_shape = (1, 1)
+        if not test_utils.is_supported_mesh_shape(mesh_shape):
+            return
+        with _mesh(mesh_shape):
+            storage = TensorStoreStateStorage.default_config().instantiate()
+            with tempfile.TemporaryDirectory() as temp_dir:
+                # We do a blocking set on the main thread and a blocking get on commit.
+                q = queue.Queue()
+                committed_value = None
+
+                def on_commit_callback(**kwargs):
+                    del kwargs
+                    nonlocal committed_value
+                    committed_value = q.get(block=True)
+
+                storage.save_to_dir(
+                    step=1,
+                    state=dict(x=jnp.zeros([], dtype=jnp.int32)),
+                    ckpt_dir=temp_dir,
+                    on_commit_callback=on_commit_callback,
+                )
+                q.put("test", block=True)
+                storage.wait_until_finished()
+                self.assertEqual("test", committed_value)
+
+    def test_save_to_dir_consecutive(self):
+        """Tests that save_to_dir waits for prior serialization to finish."""
+        mesh_shape = (1, 1)
+        if not test_utils.is_supported_mesh_shape(mesh_shape):
+            return
+        with _mesh(mesh_shape):
+            storage = TensorStoreStateStorage.default_config().instantiate()
+            with (
+                tempfile.TemporaryDirectory() as temp_dir,
+                mock.patch.multiple(
+                    storage,
+                    _serialize_chunks=mock.DEFAULT,
+                    wait_until_finished=mock.DEFAULT,
+                ) as mocks,
+            ):
+                storage.save_to_dir(
+                    step=1, state={}, ckpt_dir=temp_dir, on_commit_callback=lambda *kwargs: None
+                )
+                self.assertTrue(mocks["wait_until_finished"].called)
+
+    def test_serialize_chunks_validation(self):
+        """Tests that we raise if GDA values and specs do not match."""
+        mesh_shape = (1, 1)
+        if not test_utils.is_supported_mesh_shape(mesh_shape):
+            return
+        mock_spec = mock.MagicMock(
+            gda_values=[jnp.array(1)],
+            tensorstore_specs=[{"path": "1"}, {"path": "2"}],
+        )
+        with _mesh(mesh_shape), tempfile.TemporaryDirectory() as temp_dir:
+            storage = TensorStoreStateStorage.default_config().instantiate()
+            with self.assertRaisesRegex(AssertionError, "match number"):
+                storage._serialize_chunks(
+                    mock_spec,
+                    ckpt_dir=temp_dir,
+                    on_commit_callback=lambda **kwargs: None,
+                )
+
+    @parameterized.parameters(
+        dict(chunk_size=3, num_total=10),
+        dict(chunk_size=5, num_total=10),
+        dict(chunk_size=20, num_total=10),
+        # Make sure we commit even if GDA values are empty.
+        dict(chunk_size=20, num_total=0),
+    )
+    def test_serialize_chunks(self, chunk_size: int, num_total: int):
+        """Tests that _serialize_chunks:
+        1. Respects chunk size.
+        2. Serializes all tensors.
+        3. Does not overlap chunks.
+        4. Invokes commit only once.
+        5. Blocks until completed.
+        """
+
+        mesh_shape = (1, 1)
+        if not test_utils.is_supported_mesh_shape(mesh_shape):
+            return
+
+        all_values = set()
+        all_specs = set()
+        state = {str(i): jnp.array(i, dtype=jnp.int32) for i in range(num_total)}
+
+        # Note that each gda value is 4 bytes.
+        chunk_size_gb = (chunk_size * 4) / (1024**3)
+
+        def serialize(values: List[utils.Tensor], specs: List[Dict], *, on_commit_callback):
+            nonlocal all_values, all_specs
+            values = [int(x) for x in values]
+            specs = [x["path"] for x in specs]
+            self.assertNoCommonElements(all_values, values)
+            self.assertNoCommonElements(all_specs, specs)
+            all_values.update(values)
+            all_specs.update(specs)
+            on_commit_callback()
+
+        mock_serialize = mock.Mock(side_effect=serialize)
+        mock_wait = mock.MagicMock()
+        mock_commit = mock.MagicMock()
+        mock_spec = mock.MagicMock(
+            gda_values=list(state.values()),
+            tensorstore_specs=[{"path": x} for x in state],
+        )
+
+        with _mesh(mesh_shape):
+            storage = (
+                TensorStoreStateStorage.default_config()
+                .set(chunk_size_gb=chunk_size_gb)
+                .instantiate()
+            )
+            with (
+                mock.patch.object(
+                    storage,
+                    "_manager",
+                    mock.Mock(serialize=mock_serialize, wait_until_finished=mock_wait),
+                ),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                storage._serialize_chunks(
+                    mock_spec,
+                    ckpt_dir=temp_dir,
+                    on_commit_callback=mock_commit,
+                )
+                # Expect the right number of serialization calls.
+                expect_chunks = ceil(num_total / chunk_size)
+                self.assertEqual(expect_chunks, mock_serialize.call_count)
+
+                # Ensure that all tensors are covered.
+                self.assertSameElements(list(range(num_total)), all_values)
+                self.assertSameElements(list(state.keys()), all_specs)
+
+                # Test commit/wait invoked once each.
+                self.assertEqual(1, mock_commit.call_count)
+                self.assertEqual(1, mock_wait.call_count)
 
 
 def _write_shards(lines: Iterable[str], *, path_prefix, num_shards) -> List[str]:

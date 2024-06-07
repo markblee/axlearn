@@ -306,11 +306,15 @@ class TensorStoreStateStorage(StateStorage):
         """Configures TensorStoreStateStorage."""
 
         timeout_secs: float = 3600
+        chunk_size_gb: float = 512
 
     def __init__(self, cfg: Config):
         super().__init__(cfg)
         cfg = self.config
         self._manager = array_serialization.GlobalAsyncCheckpointManager(cfg.timeout_secs)
+        self._serialize_thread = None
+        if cfg.chunk_size_gb <= 0:
+            raise ValueError("chunk_size_gb must be strictly positive.")
 
     @dataclasses.dataclass
     class CheckpointSpec:  # pylint: disable=too-many-instance-attributes
@@ -324,6 +328,7 @@ class TensorStoreStateStorage(StateStorage):
         tf_ckpt_map: Dict[str, Any]
 
     def _spec_from_path(self, ckpt_path: str):
+        # TODO(markblee): Enable ocdbt driver.
         return array_serialization.get_tensorstore_spec(ckpt_path)
 
     def _get_spec(self, step: int, state: NestedTensor, ckpt_dir: str) -> CheckpointSpec:
@@ -394,19 +399,88 @@ class TensorStoreStateStorage(StateStorage):
         multihost_utils.sync_global_devices(ckpt_dir)
         # Each worker writes its tf checkpoints under a different path.
         save_tf_savables(spec.tf_ckpt_map, dir=os.path.join(ckpt_dir, f"tf_{jax.process_index()}"))
-        # Run serialization of GDA values in parallel.
-        logging.info(
-            "array_values=%s tensorstore=%s", utils.shapes(spec.gda_values), spec.tensorstore_specs
+        # Wait for the previous serialization to finish.
+        self.wait_until_finished()
+        # Run serialization of GDA values in parallel, in chunks of (roughly) the same size.
+        self._serialize_thread = threading.Thread(
+            target=self._serialize_chunks,
+            args=(spec,),
+            kwargs=dict(
+                ckpt_dir=ckpt_dir,
+                on_commit_callback=on_commit_callback,
+            ),
         )
-        self._manager.serialize(
-            spec.gda_values,
-            spec.tensorstore_specs,
-            on_commit_callback=lambda: on_commit_callback(ckpt_dir=ckpt_dir, index=spec.index),
+        self._serialize_thread.start()
+
+    def _serialize_chunks(
+        self,
+        spec: CheckpointSpec,
+        *,
+        ckpt_dir: str,
+        on_commit_callback: StateStorageCommitCallback = write_index_file,
+    ):
+        """Serializes a shard of GDAs, or commits if all shards have been serialized."""
+        cfg: TensorStoreStateStorage.Config = self.config
+
+        start_time = time.perf_counter()
+        num_total = len(spec.gda_values)
+        assert num_total == len(spec.tensorstore_specs), (
+            f"Expected number of GDA values ({num_total}) "
+            f"to match number of specs ({len(spec.tensorstore_specs)})."
         )
-        logging.info("GlobalAsyncCheckpointManager.serialize done")
+
+        def commit():
+            on_commit_callback(ckpt_dir=ckpt_dir, index=spec.index)
+
+        if num_total == 0:
+            commit()  # Nothing to serialize.
+
+        target_size_bytes = int(cfg.chunk_size_gb * (1024**3))
+        assert target_size_bytes > 0, "Expected target_size_bytes to be positive."
+
+        chunk_start = 0
+        while chunk_start < num_total:
+            chunk_size_bytes: int = 0
+            chunk_gda_values: List[Tensor] = []
+
+            # Accumulate tensors until target chunk size.
+            chunk_end = chunk_start
+            while chunk_end < num_total and chunk_size_bytes < target_size_bytes:
+                chunk_gda_values.append(spec.gda_values[chunk_end])
+                chunk_size_bytes += chunk_gda_values[-1].nbytes
+                chunk_end += 1
+            chunk_tensorstore_specs = spec.tensorstore_specs[chunk_start:chunk_end]
+
+            logging.info(
+                "Serializing shard indices [%s:%s) of %s totaling %s GiB.",
+                chunk_start,
+                chunk_end,
+                num_total,
+                chunk_size_bytes / (1024**3),
+            )
+            logging.info(
+                "array_values=%s tensorstore=%s",
+                utils.shapes(chunk_gda_values),
+                chunk_tensorstore_specs,
+            )
+            # Will implicitly wait for prior serialization to complete.
+            self._manager.serialize(
+                chunk_gda_values,
+                chunk_tensorstore_specs,
+                on_commit_callback=commit if chunk_end >= num_total else lambda: None,
+            )
+            chunk_start = chunk_end
+
+        # Wait on last serialization to complete (we're in our own thread).
+        self._manager.wait_until_finished()
+        logging.info("Serialization completed in %s seconds.", time.perf_counter() - start_time)
 
     def wait_until_finished(self):
-        self._manager.wait_until_finished()
+        if self._serialize_thread is not None:
+            logging.info("Waiting on previous serialization to complete...")
+            self._serialize_thread.join()
+            self._serialize_thread = None
+            logging.info("Previous serialization completed.")
 
     def restore_from_dir(
         self,
@@ -673,12 +747,10 @@ class Checkpointer(Module):
         if step < 0 or step >= 10**8:
             raise ValueError(f"Out-of-range: {step}")
         ckpt_dir = self.ckpt_dir(step)
-        start_time = time.perf_counter()
         _cleanup_checkpoint(ckpt_dir)
         self._storage.save_to_dir(
             step=step, state=state, ckpt_dir=ckpt_dir, on_commit_callback=write_index_file
         )
-        end_time = time.perf_counter()
         if "summary_writer" in self.children:
             self.summary_writer.log_checkpoint(
                 step=step,
@@ -686,9 +758,6 @@ class Checkpointer(Module):
                 ckpt_dir=ckpt_dir,
                 action=CheckpointerAction.SAVE,
             )
-        logging.info(
-            "Saved checkpoint with %s in %s seconds", type(self._storage), end_time - start_time
-        )
 
     def run_garbage_collection(self):
         """Runs one round of garbage collection of past checkpoints.

@@ -9,6 +9,7 @@ checkpointer.klass: 'axlearn.common.checkpointer.Checkpointer'
 checkpointer.save_policy.fn: 'axlearn.common.checkpointer.every_n_steps_policy'
 checkpointer.save_policy.min_step: 1
 checkpointer.save_policy.n: 500
+checkpointer.storage.chunk_size_gb: 512
 checkpointer.storage.klass: 'axlearn.common.checkpointer.TensorStoreStateStorage'
 checkpointer.storage.timeout_secs: 3600
 evalers['train'].eval_dtype: 'jax.numpy.bfloat16'
