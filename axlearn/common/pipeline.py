@@ -377,7 +377,7 @@ class Pipeline(BaseLayer):
                 t=jnp.array(0, dtype=jnp.int32),
                 # [N, microbatch_size, ...].
                 carry_output_t_1=jax.tree_util.tree_map(
-                    lambda x: jnp.zeros((n,) + x.shape[1:]), carry
+                    lambda x: jnp.zeros((n,) + x.shape[1:], dtype=jnp.bfloat16), carry
                 ),
                 # [M, N, microbatch_size, ...].
                 per_stage_inputs=per_stage_inputs,
